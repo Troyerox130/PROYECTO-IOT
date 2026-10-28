@@ -3,7 +3,6 @@ package com.example.myapplication
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.TimePickerDialog
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -12,8 +11,11 @@ import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.text.InputType
+import android.view.Gravity
 import android.widget.EditText
 import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.NumberPicker
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -36,7 +38,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var iconoEstado: ImageView
     private lateinit var txtTelemetria: TextView
 
-    private lateinit var dbRef: DatabaseReference
+    private lateinit var dispensadorRef: DatabaseReference
+    private lateinit var arduinoRef: DatabaseReference
     private lateinit var preferencias: SharedPreferences
 
     private var gramosObjetivo: Int = 250
@@ -44,6 +47,8 @@ class MainActivity : AppCompatActivity() {
     private var tiempoRestanteMs: Long = 0L
     private var enBloqueoSeguridad: Boolean = false
     private var comidaDisponibleIR: Boolean = true
+    private var dispensandoEnCurso: Boolean = false
+    private var estadoSimulador: String = "sincronizando"
     private var notificacionEnviada: Boolean = false
 
     private var temporizador: CountDownTimer? = null
@@ -72,9 +77,15 @@ class MainActivity : AppCompatActivity() {
         solicitarPermisoNotificaciones()
         crearCanalNotificaciones()
 
-        dbRef = FirebaseDatabase.getInstance().getReference("dispensador")
+        val database = FirebaseDatabase.getInstance(
+            "https://prueba-2-e60c5-default-rtdb.firebaseio.com/"
+        )
+        dispensadorRef = database.getReference("dispensador")
+        arduinoRef = database.getReference("arduino")
+
         inicializarEstructuraFirebase()
-        escucharCambiosFirebase()
+        escucharCambiosDispensador()
+        escucharCambiosArduino()
 
         if (tiempoRestanteMs > 0L) {
             iniciarCuentaRegresiva(tiempoRestanteMs)
@@ -82,24 +93,21 @@ class MainActivity : AppCompatActivity() {
             valorTiempo.text = "00:00:00"
         }
 
-        // Tocar el tiempo para configurar el horario de dispensación
         valorTiempo.setOnClickListener {
             mostrarSelectorTiempo()
         }
 
-        // Tocar los gramos para configurar el peso objetivo de la celda de carga
         valorCantidad.setOnClickListener {
             mostrarDialogoGramos()
         }
 
-        // Tocar el botón central para enviar señal manual de dispensación a la app de tu amigo
         iconoEstado.setOnClickListener {
             enviarOrdenDispensar()
         }
     }
 
     private fun inicializarEstructuraFirebase() {
-        dbRef.addListenerForSingleValueEvent(object : ValueEventListener {
+        dispensadorRef.addListenerForSingleValueEvent(object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 if (!snapshot.exists()) {
                     val datosIniciales = mapOf(
@@ -110,7 +118,7 @@ class MainActivity : AppCompatActivity() {
                         "dispensar_ahora" to false,
                         "bloqueo_activo" to false
                     )
-                    dbRef.setValue(datosIniciales)
+                    dispensadorRef.setValue(datosIniciales)
                 }
             }
 
@@ -118,8 +126,8 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun escucharCambiosFirebase() {
-        dbRef.addValueEventListener(object : ValueEventListener {
+    private fun escucharCambiosDispensador() {
+        dispensadorRef.addValueEventListener(object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 if (!snapshot.exists()) return
 
@@ -127,42 +135,109 @@ class MainActivity : AppCompatActivity() {
                     ?: preferencias.getInt(CLAVE_GRAMOS, 250)).takeIf { it > 0 }
                     ?: preferencias.getInt(CLAVE_GRAMOS, 250)
                 preferencias.edit().putInt(CLAVE_GRAMOS, gramosObjetivo).apply()
-                pesoActualPlato = snapshot.child("peso_actual").getValue(Int::class.java) ?: 0
-                val comidaDispDB = snapshot.child("comida_disponible").getValue(Boolean::class.java) ?: true
+
                 enBloqueoSeguridad = snapshot.child("bloqueo_activo").getValue(Boolean::class.java) ?: false
-                val dispensandoDB = snapshot.child("dispensar_ahora").getValue(Boolean::class.java) ?: false
+                estadoSimulador = snapshot.child("estado_simulador").getValue(String::class.java) ?: "conectado"
 
                 valorCantidad.text = "${gramosObjetivo}g"
-                actualizarUIInventario(comidaDispDB)
-
-                val estadoTexto = when {
-                    dispensandoDB -> "Dispensando comida..."
-                    enBloqueoSeguridad -> "BLOQUEO ACTIVO (Ignorando gato)"
-                    else -> "Listo para dispensar"
-                }
-                txtTelemetria.text = "Plato: ${pesoActualPlato}g / ${gramosObjetivo}g | $estadoTexto"
+                actualizarTextoTelemetria()
             }
 
             override fun onCancelled(error: DatabaseError) {
-                Toast.makeText(this@MainActivity, "Error de conexión con Firebase", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Error de conexion con Firebase", Toast.LENGTH_SHORT).show()
             }
         })
+    }
+
+    private fun escucharCambiosArduino() {
+        arduinoRef.addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (!snapshot.exists()) return
+
+                pesoActualPlato = snapshot.child("gramos_actual").getValue(Int::class.java) ?: 0
+                val comidaDispDB = snapshot.child("comida_disponible").getValue(Boolean::class.java) ?: true
+                dispensandoEnCurso = snapshot.child("dispensado_comida").getValue(Boolean::class.java) ?: false
+
+                actualizarUIInventario(comidaDispDB)
+                actualizarTextoTelemetria()
+            }
+
+            override fun onCancelled(error: DatabaseError) {}
+        })
+    }
+
+    private fun actualizarTextoTelemetria() {
+        val estadoTexto = when {
+            dispensandoEnCurso -> "Dispensando comida..."
+            enBloqueoSeguridad -> "BLOQUEO ACTIVO"
+            !comidaDisponibleIR -> "Sin alimento en contenedor"
+            pesoActualPlato >= gramosObjetivo -> "Plato lleno (${estadoSimulador})"
+            else -> "Listo (${estadoSimulador})"
+        }
+        txtTelemetria.text = "Plato: ${pesoActualPlato}g / ${gramosObjetivo}g | $estadoTexto"
     }
 
     private fun mostrarSelectorTiempo() {
         val horasActuales = (tiempoRestanteMs / 3600000).toInt()
         val minutosActuales = ((tiempoRestanteMs % 3600000) / 60000).toInt()
+        val segundosActuales = ((tiempoRestanteMs % 60000) / 1000).toInt()
 
-        TimePickerDialog(this, { _, horas, minutos ->
-            // Si seleccionas 00:00, programa 10 segundos para que puedan probar rápido en vivo
-            val nuevoTiempoSeg = if (horas == 0 && minutos == 0) 10L else ((horas * 3600) + (minutos * 60)).toLong()
-            tiempoRestanteMs = nuevoTiempoSeg * 1000L
-            guardarFechaFin(System.currentTimeMillis() + tiempoRestanteMs)
-            dbRef.child("tiempo_restante_seg").setValue(nuevoTiempoSeg)
-            dbRef.child("bloqueo_activo").setValue(false)
-            iniciarCuentaRegresiva(tiempoRestanteMs)
-            Toast.makeText(this, "Horario actualizado", Toast.LENGTH_SHORT).show()
-        }, horasActuales, minutosActuales, true).show()
+        val contenedor = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(32, 32, 32, 16)
+        }
+
+        fun crearColumna(titulo: String, max: Int, valorInicial: Int): Pair<LinearLayout, NumberPicker> {
+            val columna = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                setPadding(24, 0, 24, 0)
+            }
+            val etiqueta = TextView(this).apply {
+                text = titulo
+                gravity = Gravity.CENTER
+                textSize = 12f
+            }
+            val picker = NumberPicker(this).apply {
+                minValue = 0
+                maxValue = max
+                value = valorInicial.coerceIn(0, max)
+                setFormatter { String.format(Locale.getDefault(), "%02d", it) }
+            }
+            columna.addView(etiqueta)
+            columna.addView(picker)
+            return Pair(columna, picker)
+        }
+
+        val (colHoras, pickerHoras) = crearColumna("Horas", 23, horasActuales)
+        val (colMinutos, pickerMinutos) = crearColumna("Min", 59, minutosActuales)
+        val (colSegundos, pickerSegundos) = crearColumna("Seg", 59, segundosActuales)
+
+        contenedor.addView(colHoras)
+        contenedor.addView(colMinutos)
+        contenedor.addView(colSegundos)
+
+        AlertDialog.Builder(this)
+            .setTitle("Programar proxima racion")
+            .setView(contenedor)
+            .setPositiveButton("Guardar") { _, _ ->
+                val h = pickerHoras.value
+                val m = pickerMinutos.value
+                val s = pickerSegundos.value
+
+                val totalSegundos = ((h * 3600) + (m * 60) + s).toLong()
+                val nuevoTiempoSeg = if (totalSegundos == 0L) 10L else totalSegundos
+
+                tiempoRestanteMs = nuevoTiempoSeg * 1000L
+                guardarFechaFin(System.currentTimeMillis() + tiempoRestanteMs)
+                dispensadorRef.child("tiempo_restante_seg").setValue(nuevoTiempoSeg)
+                dispensadorRef.child("bloqueo_activo").setValue(false)
+                iniciarCuentaRegresiva(tiempoRestanteMs)
+                Toast.makeText(this, "Horario actualizado", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
     }
 
     private fun iniciarCuentaRegresiva(milisegundos: Long) {
@@ -187,7 +262,7 @@ class MainActivity : AppCompatActivity() {
                 guardarFechaFin(0L)
                 valorTiempo.text = "00:00:00"
                 if (enBloqueoSeguridad) {
-                    dbRef.child("bloqueo_activo").setValue(false)
+                    dispensadorRef.child("bloqueo_activo").setValue(false)
                     Toast.makeText(this@MainActivity, "Tiempo de bloqueo finalizado", Toast.LENGTH_SHORT).show()
                 } else {
                     enviarOrdenDispensar()
@@ -202,27 +277,30 @@ class MainActivity : AppCompatActivity() {
         input.setText(gramosObjetivo.toString())
 
         AlertDialog.Builder(this)
-            .setTitle("Configurar Cantidad (Gramos)")
-            .setMessage("Define el peso límite para la celda de carga:")
+            .setTitle("Configurar Cantidad (Max 1000g)")
+            .setMessage("Define el peso limite para la celda de carga (1g a 1000g):")
             .setView(input)
             .setPositiveButton("Guardar") { _, _ ->
-                val texto = input.text.toString()
-                if (texto.isNotEmpty()) {
-                    val nuevosGramos = texto.toInt()
-                    if (nuevosGramos <= 0) {
-                        Toast.makeText(this, "La cantidad debe ser mayor que 0", Toast.LENGTH_SHORT).show()
-                        return@setPositiveButton
-                    }
-                    gramosObjetivo = nuevosGramos
-                    preferencias.edit().putInt(CLAVE_GRAMOS, nuevosGramos).apply()
-                    dbRef.child("gramos_objetivo").setValue(nuevosGramos)
-                    Toast.makeText(this, "Cantidad guardada: ${nuevosGramos}g", Toast.LENGTH_SHORT).show()
+                val texto = input.text.toString().trim()
+                val nuevosGramos = texto.toIntOrNull()
+
+                if (nuevosGramos == null || nuevosGramos < 1 || nuevosGramos > 1000) {
+                    Toast.makeText(
+                        this,
+                        "Ingresa un valor valido entre 1g y 1000g",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@setPositiveButton
                 }
+
+                gramosObjetivo = nuevosGramos
+                preferencias.edit().putInt(CLAVE_GRAMOS, nuevosGramos).apply()
+                dispensadorRef.child("gramos_objetivo").setValue(nuevosGramos)
+                Toast.makeText(this, "Cantidad guardada: ${nuevosGramos}g", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancelar", null)
             .show()
     }
-
     private fun enviarOrdenDispensar() {
         if (enBloqueoSeguridad) {
             Toast.makeText(this, "Bloqueo de seguridad activo. Ignorando solicitud.", Toast.LENGTH_SHORT).show()
@@ -233,8 +311,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        dbRef.child("dispensar_ahora").setValue(true)
-        Toast.makeText(this, "Señal de dispensación enviada", Toast.LENGTH_SHORT).show()
+        dispensadorRef.child("dispensar_ahora").setValue(true)
+        Toast.makeText(this, "Senal de dispensacion enviada", Toast.LENGTH_SHORT).show()
     }
 
     private fun actualizarUIInventario(hayComida: Boolean) {
@@ -264,19 +342,20 @@ class MainActivity : AppCompatActivity() {
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
-            .setContentTitle("Alerta MichiFeed: nivel bajo")
-            .setContentText("El sensor infrarrojo detectó poco alimento en el contenedor principal.")
+            .setContentTitle("Alerta Balacat: nivel bajo")
+            .setContentText("El sensor infrarrojo detecto poco alimento en el contenedor principal.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
 
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(101, builder.build())
     }
+
     private fun crearCanalNotificaciones() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val canal = NotificationChannel(
                 CHANNEL_ID,
-                "Inventario MichiFeed",
+                "Inventario Balacat",
                 NotificationManager.IMPORTANCE_HIGH
             )
             val manager = getSystemService(NotificationManager::class.java)
@@ -311,6 +390,6 @@ class MainActivity : AppCompatActivity() {
         private const val PREFERENCIAS = "balacat_configuracion"
         private const val CLAVE_GRAMOS = "gramos_objetivo"
         private const val CLAVE_FECHA_FIN = "fecha_fin_temporizador"
-        private const val DURACION_INICIAL_MS = (5 * 3600 + 39 * 60 + 2) * 1000L
+        private const val DURACION_INICIAL_MS = 20342000L
     }
 }
