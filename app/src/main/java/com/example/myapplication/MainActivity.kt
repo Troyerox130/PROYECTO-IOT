@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.TimePickerDialog
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
@@ -36,10 +37,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var txtTelemetria: TextView
 
     private lateinit var dbRef: DatabaseReference
+    private lateinit var preferencias: SharedPreferences
 
     private var gramosObjetivo: Int = 250
     private var pesoActualPlato: Int = 0
-    private var tiempoRestanteMs: Long = (5 * 3600 + 39 * 60 + 2) * 1000L
+    private var tiempoRestanteMs: Long = 0L
     private var enBloqueoSeguridad: Boolean = false
     private var comidaDisponibleIR: Boolean = true
     private var notificacionEnviada: Boolean = false
@@ -50,6 +52,16 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        preferencias = getSharedPreferences(PREFERENCIAS, Context.MODE_PRIVATE)
+        gramosObjetivo = preferencias.getInt(CLAVE_GRAMOS, 250)
+        val fechaFinGuardada = preferencias.getLong(CLAVE_FECHA_FIN, -1L)
+        if (fechaFinGuardada == -1L) {
+            tiempoRestanteMs = DURACION_INICIAL_MS
+            guardarFechaFin(System.currentTimeMillis() + tiempoRestanteMs)
+        } else {
+            tiempoRestanteMs = (fechaFinGuardada - System.currentTimeMillis()).coerceAtLeast(0L)
+        }
 
         valorTiempo = findViewById(R.id.valorTiempo)
         valorCantidad = findViewById(R.id.valorCantidad)
@@ -64,7 +76,11 @@ class MainActivity : AppCompatActivity() {
         inicializarEstructuraFirebase()
         escucharCambiosFirebase()
 
-        iniciarCuentaRegresiva(tiempoRestanteMs)
+        if (tiempoRestanteMs > 0L) {
+            iniciarCuentaRegresiva(tiempoRestanteMs)
+        } else {
+            valorTiempo.text = "00:00:00"
+        }
 
         // Tocar el tiempo para configurar el horario de dispensación
         valorTiempo.setOnClickListener {
@@ -87,7 +103,7 @@ class MainActivity : AppCompatActivity() {
             override fun onDataChange(snapshot: DataSnapshot) {
                 if (!snapshot.exists()) {
                     val datosIniciales = mapOf(
-                        "gramos_objetivo" to 250,
+                        "gramos_objetivo" to preferencias.getInt(CLAVE_GRAMOS, 250),
                         "peso_actual" to 0,
                         "tiempo_restante_seg" to 20342L,
                         "comida_disponible" to true,
@@ -107,7 +123,10 @@ class MainActivity : AppCompatActivity() {
             override fun onDataChange(snapshot: DataSnapshot) {
                 if (!snapshot.exists()) return
 
-                gramosObjetivo = snapshot.child("gramos_objetivo").getValue(Int::class.java) ?: 250
+                gramosObjetivo = (snapshot.child("gramos_objetivo").getValue(Int::class.java)
+                    ?: preferencias.getInt(CLAVE_GRAMOS, 250)).takeIf { it > 0 }
+                    ?: preferencias.getInt(CLAVE_GRAMOS, 250)
+                preferencias.edit().putInt(CLAVE_GRAMOS, gramosObjetivo).apply()
                 pesoActualPlato = snapshot.child("peso_actual").getValue(Int::class.java) ?: 0
                 val comidaDispDB = snapshot.child("comida_disponible").getValue(Boolean::class.java) ?: true
                 enBloqueoSeguridad = snapshot.child("bloqueo_activo").getValue(Boolean::class.java) ?: false
@@ -138,6 +157,7 @@ class MainActivity : AppCompatActivity() {
             // Si seleccionas 00:00, programa 10 segundos para que puedan probar rápido en vivo
             val nuevoTiempoSeg = if (horas == 0 && minutos == 0) 10L else ((horas * 3600) + (minutos * 60)).toLong()
             tiempoRestanteMs = nuevoTiempoSeg * 1000L
+            guardarFechaFin(System.currentTimeMillis() + tiempoRestanteMs)
             dbRef.child("tiempo_restante_seg").setValue(nuevoTiempoSeg)
             dbRef.child("bloqueo_activo").setValue(false)
             iniciarCuentaRegresiva(tiempoRestanteMs)
@@ -147,6 +167,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun iniciarCuentaRegresiva(milisegundos: Long) {
         temporizador?.cancel()
+        if (milisegundos <= 0L) {
+            tiempoRestanteMs = 0L
+            guardarFechaFin(0L)
+            valorTiempo.text = "00:00:00"
+            return
+        }
         temporizador = object : CountDownTimer(milisegundos, 1000) {
             override fun onTick(millisUntilFinished: Long) {
                 tiempoRestanteMs = millisUntilFinished
@@ -157,6 +183,8 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onFinish() {
+                tiempoRestanteMs = 0L
+                guardarFechaFin(0L)
                 valorTiempo.text = "00:00:00"
                 if (enBloqueoSeguridad) {
                     dbRef.child("bloqueo_activo").setValue(false)
@@ -181,6 +209,12 @@ class MainActivity : AppCompatActivity() {
                 val texto = input.text.toString()
                 if (texto.isNotEmpty()) {
                     val nuevosGramos = texto.toInt()
+                    if (nuevosGramos <= 0) {
+                        Toast.makeText(this, "La cantidad debe ser mayor que 0", Toast.LENGTH_SHORT).show()
+                        return@setPositiveButton
+                    }
+                    gramosObjetivo = nuevosGramos
+                    preferencias.edit().putInt(CLAVE_GRAMOS, nuevosGramos).apply()
                     dbRef.child("gramos_objetivo").setValue(nuevosGramos)
                     Toast.makeText(this, "Cantidad guardada: ${nuevosGramos}g", Toast.LENGTH_SHORT).show()
                 }
@@ -230,7 +264,7 @@ class MainActivity : AppCompatActivity() {
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
-            .setContentTitle("Alerta BALACAT: Nivel Bajo")
+            .setContentTitle("Alerta MichiFeed: nivel bajo")
             .setContentText("El sensor infrarrojo detectó poco alimento en el contenedor principal.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
@@ -242,7 +276,7 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val canal = NotificationChannel(
                 CHANNEL_ID,
-                "Inventario BALACAT",
+                "Inventario MichiFeed",
                 NotificationManager.IMPORTANCE_HIGH
             )
             val manager = getSystemService(NotificationManager::class.java)
@@ -262,5 +296,21 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         }
+    }
+
+    private fun guardarFechaFin(fechaFin: Long) {
+        preferencias.edit().putLong(CLAVE_FECHA_FIN, fechaFin).apply()
+    }
+
+    override fun onDestroy() {
+        temporizador?.cancel()
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val PREFERENCIAS = "balacat_configuracion"
+        private const val CLAVE_GRAMOS = "gramos_objetivo"
+        private const val CLAVE_FECHA_FIN = "fecha_fin_temporizador"
+        private const val DURACION_INICIAL_MS = (5 * 3600 + 39 * 60 + 2) * 1000L
     }
 }

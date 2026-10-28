@@ -2,4 +2,11 @@
 <resources>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <color name="screen_background">#F3F7F6</color>
+    <color name="ink">#17333E</color>
+    <color name="muted_ink">#71838A</color>
+    <color name="teal">#148A83</color>
+    <color name="soft_teal">#DCEFEB</color>
+    <color name="card_border">#E5ECEA</color>
+    <color name="status_green">#278A55</color>
 </resources>
