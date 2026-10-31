@@ -45,6 +45,8 @@ class MainActivity : AppCompatActivity() {
     private var gramosObjetivo: Int = 250
     private var pesoActualPlato: Int = 0
     private var tiempoRestanteMs: Long = 0L
+    // Duración configurada para cada ciclo automático; no es el tiempo restante actual.
+    private var duracionProgramadaMs: Long = DURACION_INICIAL_MS
     private var enBloqueoSeguridad: Boolean = false
     private var comidaDisponibleIR: Boolean = true
     private var dispensandoEnCurso: Boolean = false
@@ -60,12 +62,27 @@ class MainActivity : AppCompatActivity() {
 
         preferencias = getSharedPreferences(PREFERENCIAS, Context.MODE_PRIVATE)
         gramosObjetivo = preferencias.getInt(CLAVE_GRAMOS, 250)
+        duracionProgramadaMs = preferencias
+            .getLong(CLAVE_DURACION_PROGRAMADA, DURACION_INICIAL_MS)
+            .coerceAtLeast(10_000L)
+
         val fechaFinGuardada = preferencias.getLong(CLAVE_FECHA_FIN, -1L)
+        val ahora = System.currentTimeMillis()
+
         if (fechaFinGuardada == -1L) {
-            tiempoRestanteMs = DURACION_INICIAL_MS
-            guardarFechaFin(System.currentTimeMillis() + tiempoRestanteMs)
+            // Primera ejecución: iniciar el ciclo con la duración configurada.
+            tiempoRestanteMs = duracionProgramadaMs
+            guardarFechaFin(ahora + tiempoRestanteMs)
         } else {
-            tiempoRestanteMs = (fechaFinGuardada - System.currentTimeMillis()).coerceAtLeast(0L)
+            val restante = fechaFinGuardada - ahora
+            if (restante > 0L) {
+                tiempoRestanteMs = restante
+            } else {
+                // Si la app se abrió con un contador vencido, preparar el siguiente ciclo.
+                // No se genera una orden automática adicional solo por abrir la app.
+                tiempoRestanteMs = duracionProgramadaMs
+                guardarFechaFin(ahora + tiempoRestanteMs)
+            }
         }
 
         valorTiempo = findViewById(R.id.valorTiempo)
@@ -113,7 +130,7 @@ class MainActivity : AppCompatActivity() {
                     val datosIniciales = mapOf(
                         "gramos_objetivo" to preferencias.getInt(CLAVE_GRAMOS, 250),
                         "peso_actual" to 0,
-                        "tiempo_restante_seg" to 20342L,
+                        "tiempo_restante_seg" to (duracionProgramadaMs / 1000L),
                         "comida_disponible" to true,
                         "dispensar_ahora" to false,
                         "bloqueo_activo" to false
@@ -229,7 +246,13 @@ class MainActivity : AppCompatActivity() {
                 val totalSegundos = ((h * 3600) + (m * 60) + s).toLong()
                 val nuevoTiempoSeg = if (totalSegundos == 0L) 10L else totalSegundos
 
-                tiempoRestanteMs = nuevoTiempoSeg * 1000L
+                // Guardar la duración del ciclo para reutilizarla al llegar a cero.
+                duracionProgramadaMs = nuevoTiempoSeg * 1000L
+                preferencias.edit()
+                    .putLong(CLAVE_DURACION_PROGRAMADA, duracionProgramadaMs)
+                    .apply()
+
+                tiempoRestanteMs = duracionProgramadaMs
                 guardarFechaFin(System.currentTimeMillis() + tiempoRestanteMs)
                 dispensadorRef.child("tiempo_restante_seg").setValue(nuevoTiempoSeg)
                 dispensadorRef.child("bloqueo_activo").setValue(false)
@@ -259,16 +282,42 @@ class MainActivity : AppCompatActivity() {
 
             override fun onFinish() {
                 tiempoRestanteMs = 0L
-                guardarFechaFin(0L)
                 valorTiempo.text = "00:00:00"
+
+                // Ejecutar la acción correspondiente al fin del ciclo actual.
                 if (enBloqueoSeguridad) {
                     dispensadorRef.child("bloqueo_activo").setValue(false)
-                    Toast.makeText(this@MainActivity, "Tiempo de bloqueo finalizado", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Tiempo de bloqueo finalizado",
+                        Toast.LENGTH_SHORT
+                    ).show()
                 } else {
+                    // Esta función solo envía la orden; no modifica el temporizador.
                     enviarOrdenDispensar()
                 }
+
+                // Comenzar el siguiente ciclo con la misma duración programada.
+                reiniciarTemporizadorProgramado()
             }
         }.start()
+    }
+
+    private fun reiniciarTemporizadorProgramado() {
+        val duracion = duracionProgramadaMs.takeIf { it > 0L }
+            ?: DURACION_INICIAL_MS
+
+        duracionProgramadaMs = duracion
+        tiempoRestanteMs = duracion
+
+        val nuevaFechaFin = System.currentTimeMillis() + duracion
+        guardarFechaFin(nuevaFechaFin)
+
+        // Mantener Firebase alineado con la duración del siguiente ciclo.
+        dispensadorRef.child("tiempo_restante_seg")
+            .setValue(duracion / 1000L)
+
+        iniciarCuentaRegresiva(duracion)
     }
 
     private fun mostrarDialogoGramos() {
@@ -390,6 +439,7 @@ class MainActivity : AppCompatActivity() {
         private const val PREFERENCIAS = "balacat_configuracion"
         private const val CLAVE_GRAMOS = "gramos_objetivo"
         private const val CLAVE_FECHA_FIN = "fecha_fin_temporizador"
+        private const val CLAVE_DURACION_PROGRAMADA = "duracion_programada_ms"
         private const val DURACION_INICIAL_MS = 20342000L
     }
 }
