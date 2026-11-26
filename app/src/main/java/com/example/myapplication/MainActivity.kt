@@ -10,24 +10,30 @@ import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.NumberPicker
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import com.google.firebase.database.DataSnapshot
-import com.google.firebase.database.DatabaseError
-import com.google.firebase.database.DatabaseReference
-import com.google.firebase.database.FirebaseDatabase
-import com.google.firebase.database.ValueEventListener
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
@@ -38,29 +44,40 @@ class MainActivity : AppCompatActivity() {
     private lateinit var iconoEstado: ImageView
     private lateinit var txtTelemetria: TextView
 
-    private lateinit var dispensadorRef: DatabaseReference
-    private lateinit var arduinoRef: DatabaseReference
     private lateinit var preferencias: SharedPreferences
 
+    private val IP_ARDUINO = "http://192.168.4.1"
     private var gramosObjetivo: Int = 250
     private var pesoActualPlato: Int = 0
+    private var distanciaSensorCm: Int = 0
     private var tiempoRestanteMs: Long = 0L
-    // Duración configurada para cada ciclo automático; no es el tiempo restante actual.
     private var duracionProgramadaMs: Long = DURACION_INICIAL_MS
-    private var enBloqueoSeguridad: Boolean = false
-    private var comidaDisponibleIR: Boolean = true
+    private var comidaDisponible: Boolean = true
     private var dispensandoEnCurso: Boolean = false
-    private var estadoSimulador: String = "sincronizando"
+    private var estadoConexion: String = "conectando..."
     private var notificacionEnviada: Boolean = false
 
     private var temporizador: CountDownTimer? = null
     private val CHANNEL_ID = "canal_inventario_balacat"
 
+    private val handlerPolling = Handler(Looper.getMainLooper())
+    private val tareaEstado = object : Runnable {
+        override fun run() {
+            consultarEstadoArduino()
+            handlerPolling.postDelayed(this, 3000)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        preferencias = getSharedPreferences(PREFERENCIAS, Context.MODE_PRIVATE)
+        val modoOscuro = preferencias.getBoolean(CLAVE_MODO_OSCURO, false)
+        AppCompatDelegate.setDefaultNightMode(
+            if (modoOscuro) AppCompatDelegate.MODE_NIGHT_YES else AppCompatDelegate.MODE_NIGHT_NO
+        )
+
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        preferencias = getSharedPreferences(PREFERENCIAS, Context.MODE_PRIVATE)
         gramosObjetivo = preferencias.getInt(CLAVE_GRAMOS, 250)
         duracionProgramadaMs = preferencias
             .getLong(CLAVE_DURACION_PROGRAMADA, DURACION_INICIAL_MS)
@@ -70,7 +87,6 @@ class MainActivity : AppCompatActivity() {
         val ahora = System.currentTimeMillis()
 
         if (fechaFinGuardada == -1L) {
-            // Primera ejecución: iniciar el ciclo con la duración configurada.
             tiempoRestanteMs = duracionProgramadaMs
             guardarFechaFin(ahora + tiempoRestanteMs)
         } else {
@@ -78,8 +94,6 @@ class MainActivity : AppCompatActivity() {
             if (restante > 0L) {
                 tiempoRestanteMs = restante
             } else {
-                // Si la app se abrió con un contador vencido, preparar el siguiente ciclo.
-                // No se genera una orden automática adicional solo por abrir la app.
                 tiempoRestanteMs = duracionProgramadaMs
                 guardarFechaFin(ahora + tiempoRestanteMs)
             }
@@ -91,18 +105,11 @@ class MainActivity : AppCompatActivity() {
         iconoEstado = findViewById(R.id.iconoEstado)
         txtTelemetria = findViewById(R.id.txtTelemetria)
 
+        valorCantidad.text = "${gramosObjetivo}g"
+        actualizarTextoTelemetria()
+
         solicitarPermisoNotificaciones()
         crearCanalNotificaciones()
-
-        val database = FirebaseDatabase.getInstance(
-            "https://prueba-2-e60c5-default-rtdb.firebaseio.com/"
-        )
-        dispensadorRef = database.getReference("dispensador")
-        arduinoRef = database.getReference("arduino")
-
-        inicializarEstructuraFirebase()
-        escucharCambiosDispensador()
-        escucharCambiosArduino()
 
         if (tiempoRestanteMs > 0L) {
             iniciarCuentaRegresiva(tiempoRestanteMs)
@@ -121,77 +128,223 @@ class MainActivity : AppCompatActivity() {
         iconoEstado.setOnClickListener {
             enviarOrdenDispensar()
         }
+
+        txtTelemetria.setOnClickListener {
+            mostrarMenuAjustes()
+        }
+
+        agregarBotonAjustes(modoOscuro)
+        aplicarColoresTema(modoOscuro)
+
+        handlerPolling.post(tareaEstado)
     }
 
-    private fun inicializarEstructuraFirebase() {
-        dispensadorRef.addListenerForSingleValueEvent(object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                if (!snapshot.exists()) {
-                    val datosIniciales = mapOf(
-                        "gramos_objetivo" to preferencias.getInt(CLAVE_GRAMOS, 250),
-                        "peso_actual" to 0,
-                        "tiempo_restante_seg" to (duracionProgramadaMs / 1000L),
-                        "comida_disponible" to true,
-                        "dispensar_ahora" to false,
-                        "bloqueo_activo" to false
-                    )
-                    dispensadorRef.setValue(datosIniciales)
+    private fun agregarBotonAjustes(oscuro: Boolean) {
+        val contenedorRaiz = findViewById<FrameLayout>(android.R.id.content)
+        val btnAjustes = ImageButton(this).apply {
+            setImageResource(android.R.drawable.ic_menu_preferences)
+            setBackgroundColor(Color.TRANSPARENT)
+            setColorFilter(if (oscuro) Color.WHITE else Color.DKGRAY)
+            contentDescription = "Ajustes"
+            setPadding(24, 24, 24, 24)
+            setOnClickListener { mostrarMenuAjustes() }
+        }
+
+        val params = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            topMargin = 32
+            rightMargin = 24
+        }
+
+        contenedorRaiz.addView(btnAjustes, params)
+    }
+
+    private fun aplicarColoresTema(oscuro: Boolean) {
+        val contenedorRaiz = findViewById<FrameLayout>(android.R.id.content)
+        val raizXml = contenedorRaiz.getChildAt(0) ?: return
+
+        val colorFondo = if (oscuro) Color.parseColor("#121212") else Color.WHITE
+        val colorTexto = if (oscuro) Color.WHITE else Color.parseColor("#212121")
+
+        raizXml.setBackgroundColor(colorFondo)
+        cambiarColorTextos(raizXml, colorTexto)
+    }
+
+    private fun cambiarColorTextos(vista: View, colorTexto: Int) {
+        if (vista is TextView) {
+            vista.setTextColor(colorTexto)
+        } else if (vista is ViewGroup) {
+            for (i in 0 until vista.childCount) {
+                cambiarColorTextos(vista.getChildAt(i), colorTexto)
+            }
+        }
+    }
+
+    private fun consultarEstadoArduino() {
+        Thread {
+            try {
+                val url = URL("$IP_ARDUINO/estado")
+                val conexion = url.openConnection() as HttpURLConnection
+                conexion.requestMethod = "GET"
+                conexion.connectTimeout = 2500
+                conexion.readTimeout = 2500
+
+                if (conexion.responseCode == 200) {
+                    val respuesta = conexion.inputStream.bufferedReader().use { it.readText() }
+                    val json = JSONObject(respuesta)
+
+                    val actual = json.optInt("actual", 0)
+                    val comida = json.optBoolean("comida", true)
+                    val dispensando = json.optBoolean("dispensando", false)
+                    val dist = json.optInt("dist", 0)
+
+                    runOnUiThread {
+                        pesoActualPlato = actual
+                        dispensandoEnCurso = dispensando
+                        distanciaSensorCm = dist
+                        estadoConexion = "conectado"
+                        actualizarUIInventario(comida)
+                        actualizarTextoTelemetria()
+                    }
+                }
+                conexion.disconnect()
+            } catch (e: Exception) {
+                runOnUiThread {
+                    estadoConexion = "sin conexion"
+                    actualizarTextoTelemetria()
                 }
             }
-
-            override fun onCancelled(error: DatabaseError) {}
-        })
+        }.start()
     }
 
-    private fun escucharCambiosDispensador() {
-        dispensadorRef.addValueEventListener(object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                if (!snapshot.exists()) return
+    private fun enviarOrdenDispensar() {
+        Thread {
+            try {
+                val url = URL("$IP_ARDUINO/dispensar?g=$gramosObjetivo")
+                val conexion = url.openConnection() as HttpURLConnection
+                conexion.requestMethod = "GET"
+                conexion.connectTimeout = 3000
+                conexion.readTimeout = 3000
 
-                gramosObjetivo = (snapshot.child("gramos_objetivo").getValue(Int::class.java)
-                    ?: preferencias.getInt(CLAVE_GRAMOS, 250)).takeIf { it > 0 }
-                    ?: preferencias.getInt(CLAVE_GRAMOS, 250)
-                preferencias.edit().putInt(CLAVE_GRAMOS, gramosObjetivo).apply()
+                val codigo = conexion.responseCode
+                conexion.disconnect()
 
-                enBloqueoSeguridad = snapshot.child("bloqueo_activo").getValue(Boolean::class.java) ?: false
-                estadoSimulador = snapshot.child("estado_simulador").getValue(String::class.java) ?: "conectado"
-
-                valorCantidad.text = "${gramosObjetivo}g"
-                actualizarTextoTelemetria()
+                runOnUiThread {
+                    if (codigo == 200) {
+                        Toast.makeText(this, "Dispensando ${gramosObjetivo}g...", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "Error HTTP $codigo al dispensar", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this, "Error: conectate al Wi-Fi Balacat", Toast.LENGTH_SHORT).show()
+                }
             }
-
-            override fun onCancelled(error: DatabaseError) {
-                Toast.makeText(this@MainActivity, "Error de conexion con Firebase", Toast.LENGTH_SHORT).show()
-            }
-        })
+        }.start()
     }
 
-    private fun escucharCambiosArduino() {
-        arduinoRef.addValueEventListener(object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                if (!snapshot.exists()) return
+    private fun mostrarMenuAjustes() {
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(50, 30, 50, 10)
+        }
 
-                pesoActualPlato = snapshot.child("gramos_actual").getValue(Int::class.java) ?: 0
-                val comidaDispDB = snapshot.child("comida_disponible").getValue(Boolean::class.java) ?: true
-                dispensandoEnCurso = snapshot.child("dispensado_comida").getValue(Boolean::class.java) ?: false
+        val switchOscuro = Switch(this).apply {
+            text = "Modo oscuro"
+            isChecked = preferencias.getBoolean(CLAVE_MODO_OSCURO, false)
+            setPadding(0, 16, 0, 16)
+        }
 
-                actualizarUIInventario(comidaDispDB)
-                actualizarTextoTelemetria()
+        val switchSensor = Switch(this).apply {
+            text = "Sensor ultrasonico automatico"
+            isChecked = preferencias.getBoolean(CLAVE_SENSOR_ACTIVO, true)
+            setPadding(0, 16, 0, 16)
+        }
+
+        val lblDistancia = TextView(this).apply {
+            text = "Distancia de activacion del sensor (3 a 100 cm):"
+            setPadding(0, 24, 0, 8)
+        }
+
+        val inputDistancia = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(preferencias.getInt(CLAVE_DISTANCIA_SENSOR, 15).toString())
+        }
+
+        layout.addView(switchOscuro)
+        layout.addView(switchSensor)
+        layout.addView(lblDistancia)
+        layout.addView(inputDistancia)
+
+        AlertDialog.Builder(this)
+            .setTitle("Ajustes de Balacat")
+            .setView(layout)
+            .setPositiveButton("Guardar") { _, _ ->
+                val oscuroNuevo = switchOscuro.isChecked
+                val sensorNuevo = switchSensor.isChecked
+                val distNueva = (inputDistancia.text.toString().toIntOrNull() ?: 15).coerceIn(3, 100)
+
+                val cambioTema = oscuroNuevo != preferencias.getBoolean(CLAVE_MODO_OSCURO, false)
+
+                preferencias.edit()
+                    .putBoolean(CLAVE_MODO_OSCURO, oscuroNuevo)
+                    .putBoolean(CLAVE_SENSOR_ACTIVO, sensorNuevo)
+                    .putInt(CLAVE_DISTANCIA_SENSOR, distNueva)
+                    .apply()
+
+                enviarConfigArduino(distNueva, sensorNuevo)
+
+                if (cambioTema) {
+                    AppCompatDelegate.setDefaultNightMode(
+                        if (oscuroNuevo) AppCompatDelegate.MODE_NIGHT_YES else AppCompatDelegate.MODE_NIGHT_NO
+                    )
+                }
             }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
 
-            override fun onCancelled(error: DatabaseError) {}
-        })
+    private fun enviarConfigArduino(distanciaCm: Int, sensorActivo: Boolean) {
+        val estadoSensor = if (sensorActivo) 1 else 0
+        Thread {
+            try {
+                val url = URL("$IP_ARDUINO/config?dist=$distanciaCm&sensor=$estadoSensor")
+                val conexion = url.openConnection() as HttpURLConnection
+                conexion.requestMethod = "GET"
+                conexion.connectTimeout = 3000
+                conexion.readTimeout = 3000
+
+                val codigo = conexion.responseCode
+                conexion.disconnect()
+
+                runOnUiThread {
+                    if (codigo == 200) {
+                        Toast.makeText(this, "Ajustes aplicados al Arduino", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "Error HTTP $codigo al guardar", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this, "Guardado en app (sin conexion al Arduino)", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }.start()
     }
 
     private fun actualizarTextoTelemetria() {
         val estadoTexto = when {
+            estadoConexion == "sin conexion" -> "Sin conexion (Wi-Fi Balacat)"
             dispensandoEnCurso -> "Dispensando comida..."
-            enBloqueoSeguridad -> "BLOQUEO ACTIVO"
-            !comidaDisponibleIR -> "Sin alimento en contenedor"
-            pesoActualPlato >= gramosObjetivo -> "Plato lleno (${estadoSimulador})"
-            else -> "Listo (${estadoSimulador})"
+            !comidaDisponible -> "Sin alimento en contenedor"
+            pesoActualPlato >= gramosObjetivo -> "Plato lleno ($estadoConexion)"
+            else -> "Listo ($estadoConexion)"
         }
-        txtTelemetria.text = "Plato: ${pesoActualPlato}g / ${gramosObjetivo}g | $estadoTexto"
+        txtTelemetria.text = "Plato: ${pesoActualPlato}g / ${gramosObjetivo}g | Sensor: ${distanciaSensorCm}cm | $estadoTexto"
     }
 
     private fun mostrarSelectorTiempo() {
@@ -246,7 +399,6 @@ class MainActivity : AppCompatActivity() {
                 val totalSegundos = ((h * 3600) + (m * 60) + s).toLong()
                 val nuevoTiempoSeg = if (totalSegundos == 0L) 10L else totalSegundos
 
-                // Guardar la duración del ciclo para reutilizarla al llegar a cero.
                 duracionProgramadaMs = nuevoTiempoSeg * 1000L
                 preferencias.edit()
                     .putLong(CLAVE_DURACION_PROGRAMADA, duracionProgramadaMs)
@@ -254,8 +406,6 @@ class MainActivity : AppCompatActivity() {
 
                 tiempoRestanteMs = duracionProgramadaMs
                 guardarFechaFin(System.currentTimeMillis() + tiempoRestanteMs)
-                dispensadorRef.child("tiempo_restante_seg").setValue(nuevoTiempoSeg)
-                dispensadorRef.child("bloqueo_activo").setValue(false)
                 iniciarCuentaRegresiva(tiempoRestanteMs)
                 Toast.makeText(this, "Horario actualizado", Toast.LENGTH_SHORT).show()
             }
@@ -283,21 +433,7 @@ class MainActivity : AppCompatActivity() {
             override fun onFinish() {
                 tiempoRestanteMs = 0L
                 valorTiempo.text = "00:00:00"
-
-                // Ejecutar la acción correspondiente al fin del ciclo actual.
-                if (enBloqueoSeguridad) {
-                    dispensadorRef.child("bloqueo_activo").setValue(false)
-                    Toast.makeText(
-                        this@MainActivity,
-                        "Tiempo de bloqueo finalizado",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                } else {
-                    // Esta función solo envía la orden; no modifica el temporizador.
-                    enviarOrdenDispensar()
-                }
-
-                // Comenzar el siguiente ciclo con la misma duración programada.
+                enviarOrdenDispensar()
                 reiniciarTemporizadorProgramado()
             }
         }.start()
@@ -312,11 +448,6 @@ class MainActivity : AppCompatActivity() {
 
         val nuevaFechaFin = System.currentTimeMillis() + duracion
         guardarFechaFin(nuevaFechaFin)
-
-        // Mantener Firebase alineado con la duración del siguiente ciclo.
-        dispensadorRef.child("tiempo_restante_seg")
-            .setValue(duracion / 1000L)
-
         iniciarCuentaRegresiva(duracion)
     }
 
@@ -327,7 +458,7 @@ class MainActivity : AppCompatActivity() {
 
         AlertDialog.Builder(this)
             .setTitle("Configurar Cantidad (Max 1000g)")
-            .setMessage("Define el peso limite para la celda de carga (1g a 1000g):")
+            .setMessage("Define la porcion a dispensar (1g a 1000g):")
             .setView(input)
             .setPositiveButton("Guardar") { _, _ ->
                 val texto = input.text.toString().trim()
@@ -344,35 +475,23 @@ class MainActivity : AppCompatActivity() {
 
                 gramosObjetivo = nuevosGramos
                 preferencias.edit().putInt(CLAVE_GRAMOS, nuevosGramos).apply()
-                dispensadorRef.child("gramos_objetivo").setValue(nuevosGramos)
+                valorCantidad.text = "${gramosObjetivo}g"
+                actualizarTextoTelemetria()
                 Toast.makeText(this, "Cantidad guardada: ${nuevosGramos}g", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancelar", null)
             .show()
     }
-    private fun enviarOrdenDispensar() {
-        if (enBloqueoSeguridad) {
-            Toast.makeText(this, "Bloqueo de seguridad activo. Ignorando solicitud.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (!comidaDisponibleIR) {
-            Toast.makeText(this, "Sin comida disponible en el contenedor.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        dispensadorRef.child("dispensar_ahora").setValue(true)
-        Toast.makeText(this, "Senal de dispensacion enviada", Toast.LENGTH_SHORT).show()
-    }
 
     private fun actualizarUIInventario(hayComida: Boolean) {
-        comidaDisponibleIR = hayComida
-        if (comidaDisponibleIR) {
+        comidaDisponible = hayComida
+        if (comidaDisponible) {
             tituloEstado.text = "Comida disponible"
             iconoEstado.setImageResource(android.R.drawable.checkbox_on_background)
             iconoEstado.setColorFilter(Color.parseColor("#6DB814"))
             notificacionEnviada = false
         } else {
-            tituloEstado.text = "¡Poca comida!"
+            tituloEstado.text = "Poca comida"
             iconoEstado.setImageResource(android.R.drawable.ic_delete)
             iconoEstado.setColorFilter(Color.parseColor("#D32F2F"))
             if (!notificacionEnviada) {
@@ -392,7 +511,7 @@ class MainActivity : AppCompatActivity() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
             .setContentTitle("Alerta Balacat: nivel bajo")
-            .setContentText("El sensor infrarrojo detecto poco alimento en el contenedor principal.")
+            .setContentText("El sensor detecto poco alimento en el contenedor principal.")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
 
@@ -431,6 +550,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        handlerPolling.removeCallbacks(tareaEstado)
         temporizador?.cancel()
         super.onDestroy()
     }
@@ -440,6 +560,9 @@ class MainActivity : AppCompatActivity() {
         private const val CLAVE_GRAMOS = "gramos_objetivo"
         private const val CLAVE_FECHA_FIN = "fecha_fin_temporizador"
         private const val CLAVE_DURACION_PROGRAMADA = "duracion_programada_ms"
+        private const val CLAVE_MODO_OSCURO = "modo_oscuro"
+        private const val CLAVE_SENSOR_ACTIVO = "sensor_activo"
+        private const val CLAVE_DISTANCIA_SENSOR = "distancia_sensor"
         private const val DURACION_INICIAL_MS = 20342000L
     }
 }
